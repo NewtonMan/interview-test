@@ -4,7 +4,34 @@
 # invisible to kubelet/crictl. Host dependencies: bash, curl, openssl, ssh.
 set -euo pipefail
 exec > /var/log/scenario-setup.log 2>&1
-trap 'touch /tmp/.setup-failed' ERR
+
+# --- progress + timing ---
+# /var/log/scenario-timing.log : one line per step with its duration (for you)
+# /tmp/.setup-progress         : neutral step label shown to the candidate
+TIMING=/var/log/scenario-timing.log
+SETUP_START=$(date +%s)
+STEP_NUM=0
+TOTAL_STEPS=11
+STEP_NAME=""
+: > "$TIMING"
+step() {  # $1 = detailed name (log only), $2 = neutral label (candidate)
+  local now; now=$(date +%s)
+  if [ -n "$STEP_NAME" ]; then
+    echo "[$(date +%T)] done  ($((now - STEP_START))s) $STEP_NAME" >> "$TIMING"
+  fi
+  STEP_NUM=$((STEP_NUM + 1))
+  STEP_NAME=$1
+  STEP_START=$now
+  echo "[$(date +%T)] start $STEP_NUM/$TOTAL_STEPS $1" >> "$TIMING"
+  echo "==== [$(date +%T)] STEP $STEP_NUM/$TOTAL_STEPS: $1 ===="
+  echo "Step $STEP_NUM/$TOTAL_STEPS: $2" > /tmp/.setup-progress
+}
+on_error() {
+  local rc=$? line=$1 now; now=$(date +%s)
+  echo "[$(date +%T)] FAIL  ($((now - STEP_START))s) $STEP_NAME (line $line, exit $rc)" >> "$TIMING"
+  echo "Step $STEP_NUM/$TOTAL_STEPS" > /tmp/.setup-failed
+}
+trap 'on_error $LINENO' ERR
 
 ACCOUNT=123456789012
 REGION=us-east-1
@@ -20,6 +47,7 @@ CP_IP=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+
 mkdir -p "$DIR/data"
 cd "$DIR"
 
+step "install candidate tools (upterm, share-terminal, aws mock)" "Installing tools"
 # Candidate tools first, so they exist even while (or if) the rest of setup runs.
 # --- upterm (read-only terminal sharing; tmate's public servers are gone) ---
 command -v upterm >/dev/null || {
@@ -64,6 +92,7 @@ EOF
 chmod +x /usr/local/bin/aws
 
 
+step "pull helper images (registry, httpd, nginx)" "Downloading images"
 # --- helper images ---
 # Docker Hub rate-limits anonymous pulls, and Killercoda IPs are shared,
 # so try public mirrors of the official images first, with retries.
@@ -71,9 +100,13 @@ pull_first() {  # $1 = extra pull flags ("" for none), rest = candidate refs
   local flags=$1 ref i; shift
   for ref in "$@"; do
     for i in 1 2 3; do
+      echo "[$(date +%T)] pulling $ref (attempt $i)" >&2
       if $CTR images pull $flags "$ref" >/dev/null 2>&1; then
+        echo "[$(date +%T)] pulled $ref" >&2
+        echo "  pulled $ref" >> "$TIMING"
         echo "$ref"; return 0
       fi
+      echo "  pull failed: $ref (attempt $i)" >> "$TIMING"
       sleep $((i * 3))
     done
   done
@@ -94,6 +127,7 @@ SRC_IMAGE=$(pull_first "--all-platforms" \
   docker.io/library/nginx:1.27-alpine)
 echo "using images: $REGISTRY_IMG $HTTPD_IMG $SRC_IMAGE"
 
+step "generate tokens and htpasswd" "Generating credentials"
 # --- ECR-style tokens (base64 of a JSON with an expiration) ---
 make_token() {
   local payload
@@ -110,6 +144,7 @@ chmod 600 .token
 $CTR run --rm "$HTTPD_IMG" htpasswd-gen \
   /usr/local/apache2/bin/htpasswd -Bbn AWS "$NEW_TOKEN" > htpasswd
 
+step "generate CA and TLS certificate" "Generating certificates"
 # --- TLS: own CA + certificate for the ECR hostname ---
 openssl genrsa -out ca.key 2048
 openssl req -x509 -new -key ca.key -days 30 -subj "/CN=Mock ECR CA" -out ca.crt
@@ -118,6 +153,7 @@ openssl req -new -key tls.key -subj "/CN=${HOST}" -out tls.csr
 printf "subjectAltName=DNS:%s\n" "$HOST" > san.ext
 openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 30 -extfile san.ext -out tls.crt
 
+step "start fake ECR registry container" "Starting services"
 # --- registry as a container ---
 cat > config.yml <<EOF
 version: 0.1
@@ -140,6 +176,7 @@ $CTR run -d --net-host \
   "$REGISTRY_IMG" registry \
   /bin/registry serve "${DIR}/config.yml"
 
+step "configure nodes (hosts + CA trust)" "Configuring nodes"
 # --- per-node setup: DNS + CA trust ---
 # Preferred: containerd hosts.toml (distro-agnostic, no restart needed).
 # Fallback: system CA store (Debian/Ubuntu or RHEL) + containerd restart.
@@ -182,10 +219,12 @@ chmod +x node-setup.sh
 $SCP node-setup.sh ca.crt ${WORKER}:/tmp/
 $SSH $WORKER "bash /tmp/node-setup.sh '$HOST' '$CP_IP' /tmp/ca.crt && rm -f /tmp/node-setup.sh /tmp/ca.crt"
 
+step "wait for registry and nodes Ready" "Waiting for the cluster"
 until curl -ks -o /dev/null "https://${HOST}/v2/"; do sleep 1; done
 until kubectl get nodes >/dev/null 2>&1; do sleep 2; done
 kubectl wait --for=condition=Ready nodes --all --timeout=180s
 
+step "push image to fake ECR" "Publishing application image"
 # --- push the image to the "ECR" using ctr itself ---
 $CTR images tag "$SRC_IMAGE" "$IMAGE"
 # containerd v2 requires --local with --skip-verify; older ctr has no --local
@@ -193,10 +232,12 @@ $CTR images push --local -k --user "AWS:${NEW_TOKEN}" "$IMAGE" >/dev/null \
   || $CTR images push -k --user "AWS:${NEW_TOKEN}" "$IMAGE" >/dev/null
 $CTR images rm "$IMAGE" "$SRC_IMAGE" >/dev/null
 
+step "pre-pull image on both nodes" "Preparing nodes"
 # --- pre-pull on the nodes via CRI (this is why the worker "works") ---
 crictl pull --creds "AWS:${NEW_TOKEN}" "$IMAGE"
 $SSH $WORKER "crictl pull --creds 'AWS:${NEW_TOKEN}' '$IMAGE'"
 
+step "create namespace, secret and deployments" "Deploying applications"
 # --- broken workload ---
 kubectl create namespace payments
 kubectl create secret docker-registry ecr-registry -n payments \
@@ -243,4 +284,8 @@ spec:
           ports: [{containerPort: 80}]
 EOF
 
+step "finalize" "Finishing up"
+echo "[$(date +%T)] done  (0s) finalize" >> "$TIMING"
+echo "[$(date +%T)] TOTAL $(( $(date +%s) - SETUP_START ))s" >> "$TIMING"
+echo "Ready" > /tmp/.setup-progress
 touch /tmp/.setup-done
