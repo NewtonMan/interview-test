@@ -23,6 +23,51 @@ CP_IP=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+
 mkdir -p "$DIR/data"
 cd "$DIR"
 
+# Candidate tools first, so they exist even while (or if) the rest of setup runs.
+# --- tmate (static binary, any distro; optional) ---
+command -v tmate >/dev/null || {
+  curl -fsSL https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz \
+    | tar xJ -C /tmp &&
+  mv /tmp/tmate-2.4.0-static-linux-amd64/tmate /usr/local/bin/tmate &&
+  chmod +x /usr/local/bin/tmate
+} || echo "warning: tmate not installed"
+
+cat > /usr/local/bin/share-terminal <<'EOF'
+#!/bin/bash
+if [ -z "${TMUX:-}" ]; then
+  echo "First run: tmate"
+  echo "Then, inside the session, run: share-terminal"
+  exit 1
+fi
+tmate wait tmate-ready
+echo
+echo "Send this link to your interviewer (read-only):"
+tmate display -p '#{tmate_web_ro}'
+echo
+EOF
+chmod +x /usr/local/bin/share-terminal
+
+# --- simulated AWS CLI ---
+cat > /usr/local/bin/aws <<EOF
+#!/bin/bash
+case "\$*" in
+  *"ecr get-login-password"*)
+    cat ${DIR}/.token; echo ;;
+  *"sts get-caller-identity"*)
+    echo '{"UserId":"AIDAXXXXXXXXXXXXXXXXX","Account":"${ACCOUNT}","Arn":"arn:aws:iam::${ACCOUNT}:user/sre-oncall"}' ;;
+  *"ecr describe-repositories"*)
+    echo '{"repositories":[{"repositoryName":"payments-api","repositoryUri":"${HOST}/payments-api"}]}' ;;
+  *"ecr describe-images"*)
+    echo '{"imageDetails":[{"repositoryName":"payments-api","imageTags":["1.4.2"]}]}' ;;
+  *"--version"*)
+    echo "aws-cli/2.17.0 Python/3.11.9 Linux/x86_64" ;;
+  *)
+    echo "This command is not available in this environment: aws \$*" >&2; exit 1 ;;
+esac
+EOF
+chmod +x /usr/local/bin/aws
+
+
 # --- helper images ---
 $CTR images pull "$REGISTRY_IMG" >/dev/null
 $CTR images pull "$HTTPD_IMG" >/dev/null
@@ -122,55 +167,14 @@ kubectl wait --for=condition=Ready nodes --all --timeout=180s
 
 # --- push the image to the "ECR" using ctr itself ---
 $CTR images tag "$SRC_IMAGE" "$IMAGE"
-$CTR images push -k --user "AWS:${NEW_TOKEN}" "$IMAGE" >/dev/null
+# containerd v2 requires --local with --skip-verify; older ctr has no --local
+$CTR images push --local -k --user "AWS:${NEW_TOKEN}" "$IMAGE" >/dev/null \
+  || $CTR images push -k --user "AWS:${NEW_TOKEN}" "$IMAGE" >/dev/null
 $CTR images rm "$IMAGE" "$SRC_IMAGE" >/dev/null
 
 # --- pre-pull on the nodes via CRI (this is why the worker "works") ---
 crictl pull --creds "AWS:${NEW_TOKEN}" "$IMAGE"
 $SSH $WORKER "crictl pull --creds 'AWS:${NEW_TOKEN}' '$IMAGE'"
-
-# --- tmate (static binary, any distro; optional) ---
-{
-  curl -fsSL https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz \
-    | tar xJ -C /tmp &&
-  mv /tmp/tmate-2.4.0-static-linux-amd64/tmate /usr/local/bin/tmate &&
-  chmod +x /usr/local/bin/tmate
-} || echo "warning: tmate not installed"
-
-cat > /usr/local/bin/share-terminal <<'EOF'
-#!/bin/bash
-if [ -z "${TMUX:-}" ]; then
-  echo "First run: tmate"
-  echo "Then, inside the session, run: share-terminal"
-  exit 1
-fi
-tmate wait tmate-ready
-echo
-echo "Send this link to your interviewer (read-only):"
-tmate display -p '#{tmate_web_ro}'
-echo
-EOF
-chmod +x /usr/local/bin/share-terminal
-
-# --- simulated AWS CLI ---
-cat > /usr/local/bin/aws <<EOF
-#!/bin/bash
-case "\$*" in
-  *"ecr get-login-password"*)
-    cat ${DIR}/.token; echo ;;
-  *"sts get-caller-identity"*)
-    echo '{"UserId":"AIDAXXXXXXXXXXXXXXXXX","Account":"${ACCOUNT}","Arn":"arn:aws:iam::${ACCOUNT}:user/sre-oncall"}' ;;
-  *"ecr describe-repositories"*)
-    echo '{"repositories":[{"repositoryName":"payments-api","repositoryUri":"${HOST}/payments-api"}]}' ;;
-  *"ecr describe-images"*)
-    echo '{"imageDetails":[{"repositoryName":"payments-api","imageTags":["1.4.2"]}]}' ;;
-  *"--version"*)
-    echo "aws-cli/2.17.0 Python/3.11.9 Linux/x86_64" ;;
-  *)
-    echo "This command is not available in this environment: aws \$*" >&2; exit 1 ;;
-esac
-EOF
-chmod +x /usr/local/bin/aws
 
 # --- broken workload ---
 kubectl create namespace payments
