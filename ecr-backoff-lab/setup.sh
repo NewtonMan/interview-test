@@ -10,9 +10,6 @@ ACCOUNT=123456789012
 REGION=us-east-1
 HOST="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
 IMAGE="${HOST}/payments-api:1.4.2"
-SRC_IMAGE=docker.io/library/nginx:1.27-alpine
-REGISTRY_IMG=docker.io/library/registry:2
-HTTPD_IMG=docker.io/library/httpd:2-alpine
 DIR=/opt/mock-ecr
 WORKER=node01
 SSH="ssh -o StrictHostKeyChecking=no"
@@ -68,9 +65,34 @@ chmod +x /usr/local/bin/aws
 
 
 # --- helper images ---
-$CTR images pull "$REGISTRY_IMG" >/dev/null
-$CTR images pull "$HTTPD_IMG" >/dev/null
-$CTR images pull --all-platforms "$SRC_IMAGE" >/dev/null
+# Docker Hub rate-limits anonymous pulls, and Killercoda IPs are shared,
+# so try public mirrors of the official images first, with retries.
+pull_first() {  # $1 = extra pull flags ("" for none), rest = candidate refs
+  local flags=$1 ref i; shift
+  for ref in "$@"; do
+    for i in 1 2 3; do
+      if $CTR images pull $flags "$ref" >/dev/null 2>&1; then
+        echo "$ref"; return 0
+      fi
+      sleep $((i * 3))
+    done
+  done
+  echo "could not pull any of: $*" >&2
+  return 1
+}
+REGISTRY_IMG=$(pull_first "" \
+  public.ecr.aws/docker/library/registry:2 \
+  mirror.gcr.io/library/registry:2 \
+  docker.io/library/registry:2)
+HTTPD_IMG=$(pull_first "" \
+  public.ecr.aws/docker/library/httpd:2-alpine \
+  mirror.gcr.io/library/httpd:2-alpine \
+  docker.io/library/httpd:2-alpine)
+SRC_IMAGE=$(pull_first "--all-platforms" \
+  public.ecr.aws/docker/library/nginx:1.27-alpine \
+  mirror.gcr.io/library/nginx:1.27-alpine \
+  docker.io/library/nginx:1.27-alpine)
+echo "using images: $REGISTRY_IMG $HTTPD_IMG $SRC_IMAGE"
 
 # --- ECR-style tokens (base64 of a JSON with an expiration) ---
 make_token() {
