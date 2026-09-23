@@ -8,4 +8,4 @@ while [ ! -f /tmp/.setup-done ]; do
   sleep 2
 done
 clear
-echo "Environment ready. Start by running: tmate"
+echo "Environment ready. Start by running: share-terminal"

@@ -24,26 +24,25 @@ mkdir -p "$DIR/data"
 cd "$DIR"
 
 # Candidate tools first, so they exist even while (or if) the rest of setup runs.
-# --- tmate (static binary, any distro; optional) ---
-command -v tmate >/dev/null || {
-  curl -fsSL https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz \
-    | tar xJ -C /tmp &&
-  mv /tmp/tmate-2.4.0-static-linux-amd64/tmate /usr/local/bin/tmate &&
-  chmod +x /usr/local/bin/tmate
-} || echo "warning: tmate not installed"
+# --- upterm (read-only terminal sharing; tmate's public servers are gone) ---
+command -v upterm >/dev/null || {
+  curl -fsSL https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_amd64.tar.gz \
+    | tar xz -C /usr/local/bin upterm &&
+  chmod +x /usr/local/bin/upterm
+} || echo "warning: upterm not installed"
 
 cat > /usr/local/bin/share-terminal <<'EOF'
 #!/bin/bash
-if [ -z "${TMUX:-}" ]; then
-  echo "First run: tmate"
-  echo "Then, inside the session, run: share-terminal"
-  exit 1
+if [ -n "${UPTERM_ADMIN_SOCKET:-}" ]; then
+  echo "You're already sharing. Session info:"
+  upterm session current
+  exit 0
 fi
-tmate wait tmate-ready
+echo "Starting a read-only shared session."
+echo "If asked about the host's authenticity, type: yes"
+echo "Then copy the full 'ssh ...' line below and send it to your interviewer."
 echo
-echo "Send this link to your interviewer (read-only):"
-tmate display -p '#{tmate_web_ro}'
-echo
+exec upterm host --read-only --server wss://uptermd.upterm.dev -- bash
 EOF
 chmod +x /usr/local/bin/share-terminal
 

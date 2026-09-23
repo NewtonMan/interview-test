@@ -3,16 +3,12 @@
 So your interviewer can follow along, run:
 
 ```
-tmate
-```{{exec}}
-
-Inside the session that opens, generate the link and paste it into the interview chat:
-
-```
 share-terminal
 ```{{exec}}
 
-The link is read-only: your interviewer can see what you do but can't type anything. Do the whole exercise inside this session.
+If it asks about the host's authenticity, type `yes`. Then copy the full `ssh ...` line it prints and paste it into the interview chat. If your interviewer's connection needs approval, accept it.
+
+The session is read-only: your interviewer sees what you do but can't type anything. Do the whole exercise inside this session. If you lose the join command, run `upterm session current`.
 
 ## Your mission
 
